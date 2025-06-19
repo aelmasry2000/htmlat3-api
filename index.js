@@ -1,60 +1,43 @@
 const express = require("express");
 const multer = require("multer");
-const pdfParse = require("pdf-parse");
 const cors = require("cors");
-
+const pdf = require("pdf-parse");
 const app = express();
-const upload = multer();
-app.use(cors());
 
-app.post("/extract", upload.single("file"), async (req, res) => {
-  try {
-    const dataBuffer = req.file.buffer;
-    const data = await pdfParse(dataBuffer);
-    const text = data.text;
-    const metadata = extractMetadata(text);
-    const marc = generateMARC(metadata);
-    res.json({ mrk: marc, metadata });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+app.use(cors());
+const upload = multer({ storage: multer.memoryStorage() });
+
+function clean(text) {
+  return text.replace(/\s+/g, " ").replace(/[\x00-\x1F\x7F]/g, "").trim();
+}
 
 function extractMetadata(text) {
   const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
   const isArabic = /[\u0600-\u06FF]/.test(text);
+  const topLines = lines.slice(0, 20);
 
-  const guessTitle = () => {
-    if (!isArabic) {
-      const titleLine = lines.find(l => /^title[:\-–]/i.test(l));
-      if (titleLine) return titleLine.split(/[:\-–]/)[1]?.trim();
-      return lines.find(l => /^[A-Z][A-Za-z0-9\s:;,.'"\-\(\)]{10,80}$/.test(l)) || "Unknown Title";
-    }
-    return lines.find(l => /^[\u0600-\u06FF\s]{10,}$/.test(l)) || "عنوان غير معروف";
-  };
+  let title = "";
+  let author = "";
 
-  const guessAuthor = () => {
-    if (!isArabic) {
-      const authorLine = lines.find(l => /^author[:\-–]/i.test(l));
-      if (authorLine) return authorLine.split(/[:\-–]/)[1]?.trim();
-      const byLine = lines.find(l => /\bby\b/i.test(l));
-      if (byLine) return byLine.replace(/.*\bby\b/i, '').trim();
-      return "Unknown Author";
-    }
-    const authorLine = lines.find(l => /(?:تأليف|بقلم)/.test(l));
-    return authorLine ? authorLine.replace(/.*(?:تأليف|بقلم)/, "").trim() : "مؤلف غير معروف";
-  };
+  if (isArabic) {
+    title = topLines.find(l => /^[\u0600-\u06FF\s]{10,}$/.test(l)) || "عنوان غير معروف";
+    const aLine = lines.find(l => /(?:تأليف|بقلم)/.test(l));
+    author = aLine ? aLine.replace(/.*(?:تأليف|بقلم)/, "").trim() : "مؤلف غير معروف";
+  } else {
+    title = topLines.find(l => /^[A-Z][A-Z\s,:;'"&-]{10,80}$/.test(l)) || topLines[0] || "Unknown Title";
+    const byLine = topLines.find(l => /\bby\b/i.test(l)) || lines.find(l => /\bby\b/i.test(l));
+    author = byLine ? byLine.replace(/.*\bby\b/i, "").trim() : "Unknown Author";
+  }
 
-  const cleanText = (str) => str.replace(/\s+/g, ' ').replace(/[\x00-\x1F\x7F]/g, '').trim();
+  title = clean(title);
+  author = clean(author);
 
-  const title = cleanText(guessTitle());
-  const author = cleanText(guessAuthor());
-  const year = (text.match(/\b(1[89]|20)\d{2}\b/) || [])[0] || "Unknown Year";
-  const isbn = cleanText((text.match(/isbn[:\s]*([\d\-]+)/i) || [])[1] || "[ISBN not found]");
-  const publisher = cleanText((text.match(/(?:publisher|published by|الناشر)[:\-–]?\s*(.+)/i) || [])[1] || "[Publisher not found]");
+  const year = (text.match(/\b(18|19|20)\d{2}\b/) || [])[0] || "Unknown Year";
+  const isbn = clean((text.match(/isbn[:\s]*([\d\-]+)/i) || [])[1] || "[ISBN not found]");
+  const publisher = clean((text.match(/(?:publisher|published by|الناشر)[:\-–]?\s*(.+)/i) || [])[1] || "[Publisher not found]");
 
   const paras = text.split(/\n\s*\n/);
-  const summary = cleanText(paras.reduce((a, b) => b.length > a.length ? b : a, "").slice(0, 300));
+  const summary = clean(paras.reduce((a, b) => b.length > a.length ? b : a, "").slice(0, 300));
 
   return {
     title,
@@ -68,12 +51,10 @@ function extractMetadata(text) {
   };
 }
 
-function generateMARC(metadata) {
+function buildMARC(metadata) {
   const now = new Date();
   const controlDate = now.toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
   const todayShort = now.toISOString().slice(0, 10).replace(/-/g, '');
-  const coauthorFields = metadata.coauthors.map(name => `=700 1# $a${name}, $econtributor.`).join("\n");
-
   return `=LDR  00000nam a2200000 a 4500
 =001  000000001
 =005  ${controlDate}.0
@@ -89,10 +70,22 @@ function generateMARC(metadata) {
 =337  ##$aunmediated$bn$2rdamedia
 =338  ##$avolume$bnc$2rdacarrier
 =500  ##$aCataloged using automated extraction.
-=520  ##$a${metadata.summary}
-=546  ##$aText in Arabic and/or English.
-${coauthorFields}`;
+=520  ##$a${metadata.summary || '[No summary found]'}
+=546  ##$aText in Arabic and/or English.`;
 }
+
+app.post("/extract", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  try {
+    const data = await pdf(req.file.buffer);
+    const text = data.text;
+    const metadata = extractMetadata(text);
+    const mrk = buildMARC(metadata);
+    res.json({ mrk, metadata });
+  } catch (err) {
+    res.status(500).json({ error: "Extraction failed" });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
