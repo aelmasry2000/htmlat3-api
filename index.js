@@ -1,91 +1,102 @@
-const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const pdf = require("pdf-parse");
+// index.js (complete)
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const pdfParse = require('pdf-parse');
 const app = express();
+const upload = multer();
 
 app.use(cors());
-const upload = multer({ storage: multer.memoryStorage() });
-
-function clean(text) {
-  return text.replace(/\s+/g, " ").replace(/[\x00-\x1F\x7F]/g, "").trim();
-}
+app.use(express.json());
 
 function extractMetadata(text) {
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-  const isArabic = /[\u0600-\u06FF]/.test(text);
-  const topLines = lines.slice(0, 20);
-
-  let title = "";
-  let author = "";
-
-  if (isArabic) {
-    title = topLines.find(l => /^[\u0600-\u06FF\s]{10,}$/.test(l)) || "عنوان غير معروف";
-    const aLine = lines.find(l => /(?:تأليف|بقلم)/.test(l));
-    author = aLine ? aLine.replace(/.*(?:تأليف|بقلم)/, "").trim() : "مؤلف غير معروف";
-  } else {
-    title = topLines.find(l => /^[A-Z][A-Z\s,:;'"&-]{10,80}$/.test(l)) || topLines[0] || "Unknown Title";
-    const byLine = topLines.find(l => /\bby\b/i.test(l)) || lines.find(l => /\bby\b/i.test(l));
-    author = byLine ? byLine.replace(/.*\bby\b/i, "").trim() : "Unknown Author";
-  }
-
-  title = clean(title);
-  author = clean(author);
-
-  const year = (text.match(/\b(18|19|20)\d{2}\b/) || [])[0] || "Unknown Year";
-  const isbn = clean((text.match(/isbn[:\s]*([\d\-]+)/i) || [])[1] || "[ISBN not found]");
-  const publisher = clean((text.match(/(?:publisher|published by|الناشر)[:\-–]?\s*(.+)/i) || [])[1] || "[Publisher not found]");
-
-  const paras = text.split(/\n\s*\n/);
-  const summary = clean(paras.reduce((a, b) => b.length > a.length ? b : a, "").slice(0, 300));
-
-  return {
-    title,
-    author,
-    publisher,
-    year,
-    isbn,
-    issn: "",
-    summary,
-    coauthors: []
-  };
+  const lines = text.split(/\n|\r/).map(l => l.trim()).filter(Boolean);
+  const joined = text.replace(/\s+/g, ' ');
+  const title = lines.find(l => /title/i.test(l)) || 'Unknown Title';
+  const author = lines.find(l => /author/i.test(l)) || 'Unknown Author';
+  const yearMatch = joined.match(/\b(1[89]|20)\d{2}\b/);
+  const year = yearMatch ? yearMatch[0] : 'Unknown Year';
+  const publisher = lines.find(l => /publisher/i.test(l)) || '[Publisher not found]';
+  const summary = lines.slice(0, 10).join(' ').slice(0, 300);
+  return { title, author, year, publisher, summary };
 }
 
-function buildMARC(metadata) {
-  const now = new Date();
-  const controlDate = now.toISOString().replace(/[-T:.Z]/g, '').slice(0, 14);
-  const todayShort = now.toISOString().slice(0, 10).replace(/-/g, '');
+function buildMARC({ title, author, year, publisher, summary }) {
   return `=LDR  00000nam a2200000 a 4500
 =001  000000001
-=005  ${controlDate}.0
-=008  ${todayShort}s${metadata.year}\\xx\\eng\\d
-=020  ##$a${metadata.isbn}
+=005  ${new Date().toISOString().replace(/[-:.TZ]/g, '')}.0
+=008  ${new Date().toISOString().slice(0, 10).replace(/-/g, '')}s${year}\\xx\\eng\\d
+=020  ##$a[ISBN not found]
 =041  0#$aeng
-=100  1#$a${metadata.author}
-=245  10$a${metadata.title} /$c${metadata.author}
+=100  1#$a${author}
+=245  10$a${title} /$c${author}.
 =250  ##$aFirst edition.
-=264  _1$a[Place not identified] :$b${metadata.publisher},$c${metadata.year}.
+=264  _1$a[Place not identified] :$b${publisher},$c${year}.
 =300  ##$a300 pages :$billustrations ;$c24 cm.
 =336  ##$atext$btxt$2rdacontent
 =337  ##$aunmediated$bn$2rdamedia
 =338  ##$avolume$bnc$2rdacarrier
 =500  ##$aCataloged using automated extraction.
-=520  ##$a${metadata.summary || '[No summary found]'}
+=520  ##$a${summary || 'Cataloged using basic automated extraction.'}
 =546  ##$aText in Arabic and/or English.`;
 }
 
-app.post("/extract", upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+function buildJSON(metadata) {
+  return {
+    leader: '00000nam a2200000 a 4500',
+    control: {
+      id: '000000001',
+      date: new Date().toISOString(),
+    },
+    fields: {
+      title: metadata.title,
+      author: metadata.author,
+      year: metadata.year,
+      publisher: metadata.publisher,
+      summary: metadata.summary,
+    }
+  };
+}
+
+function buildXML(metadata) {
+  return `<?xml version="1.0"?>
+<record>
+  <leader>00000nam a2200000 a 4500</leader>
+  <controlfield tag="001">000000001</controlfield>
+  <controlfield tag="005">${new Date().toISOString()}</controlfield>
+  <datafield tag="100" ind1="1" ind2="#">
+    <subfield code="a">${metadata.author}</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">${metadata.title}</subfield>
+  </datafield>
+  <datafield tag="264" ind1="_" ind2="1">
+    <subfield code="b">${metadata.publisher}</subfield>
+    <subfield code="c">${metadata.year}</subfield>
+  </datafield>
+  <datafield tag="520" ind1="#" ind2="#">
+    <subfield code="a">${metadata.summary}</subfield>
+  </datafield>
+</record>`;
+}
+
+app.post('/extract', upload.single('file'), async (req, res) => {
   try {
-    const data = await pdf(req.file.buffer);
-    const text = data.text;
-    const metadata = extractMetadata(text);
+    const buffer = req.file.buffer;
+    const data = await pdfParse(buffer);
+    const metadata = extractMetadata(data.text);
     const mrk = buildMARC(metadata);
-    res.json({ mrk, metadata });
+    const json = buildJSON(metadata);
+    const xml = buildXML(metadata);
+    res.json({ mrk, json, xml });
   } catch (err) {
-    res.status(500).json({ error: "Extraction failed" });
+    res.status(500).json({ error: 'Extraction failed', details: err.message });
   }
 });
 
+app.get('/', (req, res) => {
+  res.send('✅ MARC21 Extraction API is running.');
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
