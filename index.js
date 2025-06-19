@@ -1,53 +1,34 @@
-const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const fs = require("fs");
-const pdfParse = require("pdf-parse");
-
+// index.js (complete)
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const pdfParse = require('pdf-parse');
 const app = express();
-const upload = multer({ dest: "uploads/" });
+const upload = multer();
 
 app.use(cors());
 app.use(express.json());
 
-function clean(text) {
-  return text.replace(/\s+/g, " ").replace(/[\x00-\x1F\x7F]/g, "").trim();
-}
-
 function extractMetadata(text) {
-  const lines = text.split("\n").map(line => line.trim()).filter(Boolean);
-  const fullText = lines.join(" ");
-  const title = clean((text.match(/title[:\-\s]+(.+)/i) || [])[1] || lines[0] || "Unknown Title");
-  const author = clean((text.match(/author[:\-\s]+(.+)/i) || [])[1] || "Unknown Author");
-  const year = (text.match(/\b(18|19|20)\d{2}\b/) || [])[0] || "Unknown Year";
-  const publisher = clean((text.match(/publisher[:\-\s]+(.+)/i) || [])[1] || "[Publisher not found]");
-  const isbn = (text.match(/isbn[\s\-:]*(\d{10,13})/i) || [])[1] || "";
-  const summary = clean(fullText.split(". ").slice(1, 3).join(". ").slice(0, 500)) || "Cataloged using basic automated extraction.";
-
-  return { title, author, year, publisher, isbn, summary };
+  const lines = text.split(/\n|\r/).map(l => l.trim()).filter(Boolean);
+  const joined = text.replace(/\s+/g, ' ');
+  const title = lines.find(l => /title/i.test(l)) || 'Unknown Title';
+  const author = lines.find(l => /author/i.test(l)) || 'Unknown Author';
+  const yearMatch = joined.match(/\b(1[89]|20)\d{2}\b/);
+  const year = yearMatch ? yearMatch[0] : 'Unknown Year';
+  const publisher = lines.find(l => /publisher/i.test(l)) || '[Publisher not found]';
+  const summary = lines.slice(0, 10).join(' ').slice(0, 300);
+  return { title, author, year, publisher, summary };
 }
 
-function buildMARC(metadata) {
-  const {
-    title,
-    author,
-    year,
-    publisher,
-    isbn,
-    summary
-  } = metadata;
-
-  const now = new Date();
-  const controlDate = now.toISOString().replace(/[-:T]/g, "").slice(0, 14);
-  const shortDate = now.toISOString().split("T")[0].replace(/-/g, "");
-
+function buildMARC({ title, author, year, publisher, summary }) {
   return `=LDR  00000nam a2200000 a 4500
 =001  000000001
-=005  ${controlDate}.0
-=008  ${shortDate}s${year}\\xx\\\\\\\\\\\\eng\\\\\\\\\\\\d
-=020  ##$a${isbn || '[ISBN not found]'}
-=041  0#$aara
-=100  1#$a${author}.
+=005  ${new Date().toISOString().replace(/[-:.TZ]/g, '')}.0
+=008  ${new Date().toISOString().slice(0, 10).replace(/-/g, '')}s${year}\\xx\\eng\\d
+=020  ##$a[ISBN not found]
+=041  0#$aeng
+=100  1#$a${author}
 =245  10$a${title} /$c${author}.
 =250  ##$aFirst edition.
 =264  _1$a[Place not identified] :$b${publisher},$c${year}.
@@ -55,38 +36,67 @@ function buildMARC(metadata) {
 =336  ##$atext$btxt$2rdacontent
 =337  ##$aunmediated$bn$2rdamedia
 =338  ##$avolume$bnc$2rdacarrier
-=500  ##$aRecord generated using automated extraction tool.
-=520  ##$a${summary}
+=500  ##$aCataloged using automated extraction.
+=520  ##$a${summary || 'Cataloged using basic automated extraction.'}
 =546  ##$aText in Arabic and/or English.`;
 }
 
-app.post("/extract", upload.single("file"), async (req, res) => {
-  try {
-    const { path, originalname } = req.file;
-    let text = "";
-
-    if (originalname.endsWith(".pdf")) {
-      const dataBuffer = fs.readFileSync(path);
-      const pdfData = await pdfParse(dataBuffer);
-      text = pdfData.text;
-    } else {
-      text = fs.readFileSync(path, "utf8");
+function buildJSON(metadata) {
+  return {
+    leader: '00000nam a2200000 a 4500',
+    control: {
+      id: '000000001',
+      date: new Date().toISOString(),
+    },
+    fields: {
+      title: metadata.title,
+      author: metadata.author,
+      year: metadata.year,
+      publisher: metadata.publisher,
+      summary: metadata.summary,
     }
+  };
+}
 
-    const metadata = extractMetadata(text);
+function buildXML(metadata) {
+  return `<?xml version="1.0"?>
+<record>
+  <leader>00000nam a2200000 a 4500</leader>
+  <controlfield tag="001">000000001</controlfield>
+  <controlfield tag="005">${new Date().toISOString()}</controlfield>
+  <datafield tag="100" ind1="1" ind2="#">
+    <subfield code="a">${metadata.author}</subfield>
+  </datafield>
+  <datafield tag="245" ind1="1" ind2="0">
+    <subfield code="a">${metadata.title}</subfield>
+  </datafield>
+  <datafield tag="264" ind1="_" ind2="1">
+    <subfield code="b">${metadata.publisher}</subfield>
+    <subfield code="c">${metadata.year}</subfield>
+  </datafield>
+  <datafield tag="520" ind1="#" ind2="#">
+    <subfield code="a">${metadata.summary}</subfield>
+  </datafield>
+</record>`;
+}
+
+app.post('/extract', upload.single('file'), async (req, res) => {
+  try {
+    const buffer = req.file.buffer;
+    const data = await pdfParse(buffer);
+    const metadata = extractMetadata(data.text);
     const mrk = buildMARC(metadata);
-    fs.unlinkSync(path); // delete uploaded temp file
-
-    res.json({ mrk });
+    const json = buildJSON(metadata);
+    const xml = buildXML(metadata);
+    res.json({ mrk, json, xml });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to process file." });
+    res.status(500).json({ error: 'Extraction failed', details: err.message });
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("MARC21 Cataloging API is running.");
+app.get('/', (req, res) => {
+  res.send('✅ MARC21 Extraction API is running.');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server started on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on http://localhost:${PORT}`));
